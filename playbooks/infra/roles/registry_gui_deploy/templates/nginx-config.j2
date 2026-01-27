@@ -30,7 +30,7 @@ http {
                 return 204;
             }
 
-            proxy_pass https://127.0.0.1:5000/;
+            proxy_pass https://127.0.0.1:5000;
             proxy_ssl_verify off;  # disable SSL verification if registry uses self-signed cert
 
             proxy_set_header Host $host;
