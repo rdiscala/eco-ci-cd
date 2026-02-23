@@ -1,0 +1,119 @@
+## Disclaimer:
+# This playbook is not officially supported and comes with no guarantees.
+# Use it at your own risk. Test thoroughly in your environment before production use.
+#
+# This Ansible playbook automates the expansion of a Single Node OpenShift
+# (SNO) cluster by adding an additional worker node as a Day 2 operation.
+# It follows the documentation at:
+#   https://docs.redhat.com/en/documentation/openshift_container_platform/4.19/html/edge_computing/ztp-sno-additional-worker-node
+
+## Overview:
+# - Pre-deployment checks
+
+## Prerequisites:
+# - Ansible 2.10+ on the control node
+# - SSH access to bastion (and hypervisors/VM hosts if using VMs)
+# - Inventory with required host_vars/group_vars populated
+# - If disconnected: reachable local registry and permissions
+#
+# Required variables (examples):
+# - release: OpenShift version or pullspec (e.g., 4.17, quay.io/...:4.15.44-x86_64)
+# - spoke_cluster_name: cluster identifier used for generated artifacts
+# - pull_secret_string: base64-encoded OpenShift pull secret (JSON)
+#
+# Optional variables:
+# - ipv4_only, ipv6_only, disconnected (booleans; defaults are false)
+# - disconnected_registry_url, disconnected_registry_port
+# - share_http_iso_port, dest_iso_dir, repo_root_path
+# - extra_manifests_folder: folder containing extra manifests for Day0 installation
+
+## Roles Requirements
+
+## Usage:
+---
+- name: "Expand a SNO cluster by adding a worker as a Day 2 operation"
+  hosts: bastion
+  gather_facts: true
+  vars:
+    disconnected: false
+    spoke_cluster_name: ""
+    kubeconfig: ""
+  tasks:
+    - name: Assert that the required extra vars are provided and non-empty
+      ansible.builtin.assert:
+        that:
+          - spoke_cluster_name | length > 0
+          - kubeconfig | length > 0
+        fail_msg: "the required extra vars must be provided and non-empty"
+
+    - name: Define a random id for this playbook session
+      ansible.builtin.set_fact:
+        playbook_run_id: "deploy-day2-{{ lookup('community.general.random_string', length=6, special=false, upper=false) }}"
+
+    - name: Print randomised the session id
+      debug: var=playbook_run_id
+
+    - name: Define the name of the spoke kubeconfig file
+      ansible.builtin.set_fact:
+        spoke_kubeconfig: "/tmp/{{ playbook_run_id }}-spoke-kubeconfig"
+
+    - name: Set up a block that will clean up after execution
+      always:
+        - name: "Clean up temporary files"
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: absent
+          loop:
+            - "{{ spoke_kubeconfig }}"
+      block:
+
+        - name: Get spoke kubeconfig from hub
+          kubernetes.core.k8s_info:
+            api_version: v1
+            kind: Secret
+            name: "{{ spoke_cluster_name }}-admin-kubeconfig"
+            namespace: "{{ spoke_cluster_name }}"
+            kubeconfig: "{{ kubeconfig }}"
+          register: spoke_secret
+
+        - name: Fail if secret not found
+          ansible.builtin.fail:
+            msg: "Kubeconfig secret not found for cluster {{ spoke_cluster_name }}"
+          when: spoke_secret.resources | length == 0
+
+        - name: Write spoke kubeconfig
+          ansible.builtin.copy:
+            content: "{{ spoke_secret.resources[0].data.kubeconfig | b64decode }}"
+            dest: "{{ spoke_kubeconfig }}"
+            mode: '0600'
+
+        - name: Check that the daemon node selector is not set to worker
+          block:
+
+            - name: Get PTP operator config from spoke cluster
+              kubernetes.core.k8s_info:
+                api_version: ptp.openshift.io/v1
+                kind: PtpOperatorConfig
+                name: default
+                namespace: openshift-ptp
+                kubeconfig: "{{ spoke_kubeconfig }}"
+              register: ptp_operator_config
+
+            - name: Fail if PtpOperatorConfig not found
+              ansible.builtin.fail:
+                msg: "PtpOperatorConfig/default not found in namespace openshift-ptp"
+              when: ptp_operator_config.resources | length == 0
+
+            - name: Set fact for PTP daemon node selector
+              ansible.builtin.set_fact:
+                ptp_daemon_node_selector: "{{ ptp_operator_config.resources[0].spec.daemonNodeSelector | default({}) }}"
+
+            - name: Fail if PTP daemon node selector is set to master
+              ansible.builtin.fail:
+                msg: >-
+                  PTP Operator daemonNodeSelector is set to 'master'.
+                  The spoke was deployed with an older GitOps ZTP plugin version
+                  that requires node selector changes before proceeding with the
+                  worker DU profile configuration.
+              when: "'node-role.kubernetes.io/master' in ptp_daemon_node_selector"
+
