@@ -2,35 +2,25 @@
 # Mirror MCE, RHACM, and operator catalog images required by the spoke cluster
 # to the disconnected registry.
 #
-# Two mirroring conventions are used, matching how images end up in the
-# disconnected registry:
+# Two mirroring methods are used:
 #
-#   MCE/RHACM images (discovered from hub deployments):
-#     registry.redhat.io/multicluster-engine/foo  ->  mirror/multicluster-engine/foo
-#     (direct path, via skopeo)
+#   oc-mirror v2 (operator catalog content):
+#     Declaratively mirrors catalog index images, operator bundle images, and
+#     their relatedImages to the disconnected registry under the operators/
+#     prefix. Automatically generates IDMS and CatalogSource resources.
 #
-#   Operator catalog images (discovered from hub PackageManifests):
-#     registry.redhat.io/openshift-logging/foo    ->  mirror/operators/openshift-logging/foo
-#     registry.redhat.io/openshift4/foo           ->  mirror/operators/openshift4/foo
-#     registry.connect.redhat.com/intel/foo       ->  mirror/operators/intel/foo
-#     (operators/ prefix, matching the oc-mirror convention used for OLM content)
-#
-# IDMS resources are created so the spoke's registries.conf includes the correct
-# mirrors for both conventions.
-#
-# NOTE: local-storage-operator exposes no relatedImages in its PackageManifest.
-# Its bundle image (openshift4/ose-local-storage-operator-bundle) must be
-# pre-mirrored by oc-mirror. The operators/openshift4 IDMS entry generated here
-# (from sriov/ptp relatedImages) covers it.
+#   skopeo (MCE/RHACM images):
+#     Mirrors dynamically discovered MCE/RHACM images from hub deployments to
+#     direct paths (no operators/ prefix) matching the spoke's IDMS.
 #
 # Prerequisites:
 #   - Valid kubeconfig for hub cluster authentication
-#   - oc and skopeo CLI tools installed
+#   - oc, oc-mirror (v2), and skopeo CLI tools installed
 #   - Access to registry.redhat.io (authenticated via hub pull secret)
 #   - Disconnected registry reachable at {{ mirror_registry }}
 #
 # Usage:
-#   ansible-playbook playbooks/ran/mirror-operators-spoke-day0.yml \
+#   ansible-playbook playbooks/ran/mirror-mce-images.yml \
 #     -i inventories/ocp-deployment/build-inventory.py \
 #     --extra-vars "kubeconfig=/path/to/hub/kubeconfig"
 #
@@ -45,24 +35,30 @@
     pull_secret_path: "/tmp/mirror-day0-pull-secret.json"
     operator_mirror_prefix: "operators"
     source_registry_rht: "registry.redhat.io"
-    source_registry_connect: "registry.connect.redhat.com"
+    ocp_version: "4.19"
+    imageset_config_path: "/tmp/mirror-day0-imageset-config.yaml"
+    oc_mirror_workspace: "/tmp/mirror-day0-workspace"
 
-    # Operators whose PackageManifest relatedImages should be mirrored under
-    # the operators/ prefix. Add entries here as the spoke workload grows.
-    # NOTE: local-storage-operator has no relatedImages in its PackageManifest;
-    # its bundle image is covered by the operators/openshift4 IDMS entry
-    # generated from the sriov-network-operator and ptp-operator relatedImages.
+    # Operator packages to mirror from production catalogs.
+    # oc-mirror discovers all bundle images and relatedImages automatically.
+    # Packages served by custom/art catalog sources (ptp-operator,
+    # sriov-network-operator) are excluded — their content is already
+    # included in the custom index images.
     spoke_operator_packages:
-      - cluster-logging
-      - sriov-network-operator
-      - ptp-operator
-      - sriov-fec
+      - name: local-storage-operator
+        catalog: redhat-operators
+        channel: stable
+      - name: cluster-logging
+        catalog: redhat-operators
+        channel: stable-6.4
+      - name: sriov-fec
+        catalog: certified-operators
+        channel: stable
 
-    # Operator catalog index images that must be mirrored so that
-    # CatalogSource pods on the spoke can pull them.
-    spoke_catalog_index_images:
-      - source: "registry.redhat.io/redhat/certified-operator-index:v4.19"
-        destination: "{{ operator_mirror_prefix }}/redhat/certified-operator-index:v4.19"
+    # Map catalog short names to index image references
+    catalog_index_map:
+      redhat-operators: "{{ source_registry_rht }}/redhat/redhat-operator-index:v{{ ocp_version }}"
+      certified-operators: "{{ source_registry_rht }}/redhat/certified-operator-index:v{{ ocp_version }}"
 
   tasks:
 
@@ -171,44 +167,111 @@
           ansible.builtin.debug:
             msg: "Found {{ mce_rhacm_images | length }} MCE/RHACM images to mirror (direct path)"
 
-        # ---- Discover operator relatedImages from PackageManifests ----
+        # ---- Build ImageSetConfiguration for oc-mirror ----
 
-        - name: Get PackageManifest JSON for each operator
-          ansible.builtin.command:
-            cmd: >-
-              oc get packagemanifest {{ item }}
-              --kubeconfig {{ kubeconfig }}
-              -o json
-          loop: "{{ spoke_operator_packages }}"
-          loop_control:
-            label: "{{ item }}"
-          register: package_manifest_results
-          changed_when: false
-          failed_when: false
-
-        - name: Extract relatedImages from all channels of each PackageManifest
+        - name: Build Red Hat operator packages
           ansible.builtin.set_fact:
-            operator_images: >-
+            pkgs_redhat: "{{ (pkgs_redhat | default([])) + [make_pkg] }}"
+          vars:
+            make_pkg: >-
+              {{ {'name': item.name, 'channels': [{'name': item.channel}]} }}
+          loop: "{{ spoke_operator_packages | selectattr('catalog', 'equalto', 'redhat-operators') | list }}"
+          loop_control:
+            loop_var: item
+            label: "{{ item.name }}"
+
+        - name: Build certified operator packages
+          ansible.builtin.set_fact:
+            pkgs_certified: "{{ (pkgs_certified | default([])) + [make_pkg] }}"
+          vars:
+            make_pkg: >-
+              {{ {'name': item.name, 'channels': [{'name': item.channel}]} }}
+          loop: "{{ spoke_operator_packages | selectattr('catalog', 'equalto', 'certified-operators') | list }}"
+          loop_control:
+            loop_var: item
+            label: "{{ item.name }}"
+
+        - name: Assemble operators for ImageSetConfiguration
+          ansible.builtin.set_fact:
+            mirror_operators: >-
               {{
-                package_manifest_results.results
-                | selectattr('rc', 'equalto', 0)
-                | map(attribute='stdout')
-                | map('from_json')
-                | map(attribute='status.channels')
-                | flatten
-                | map(attribute='currentCSVDesc.relatedImages', default=[])
-                | flatten
-                | selectattr('image', 'defined')
-                | map(attribute='image')
-                | select('match', '^(registry\.redhat\.io|registry\.connect\.redhat\.com)/')
-                | unique | sort | list
+                ([] if (pkgs_redhat | default([])) | length == 0 else
+                  [{'catalog': catalog_index_map['redhat-operators'], 'packages': pkgs_redhat}])
+                +
+                ([] if (pkgs_certified | default([])) | length == 0 else
+                  [{'catalog': catalog_index_map['certified-operators'], 'packages': pkgs_certified}])
               }}
 
-        - name: Display operator images to mirror
-          ansible.builtin.debug:
-            msg: "Found {{ operator_images | length }} operator catalog images to mirror ({{ operator_mirror_prefix }}/ prefix)"
+        - name: Build ImageSetConfiguration
+          ansible.builtin.set_fact:
+            image_set_config:
+              apiVersion: mirror.openshift.io/v1alpha2
+              kind: ImageSetConfiguration
+              mirror:
+                operators: "{{ mirror_operators }}"
 
-        # ---- Mirror MCE/RHACM images (direct path) ----
+        - name: Show ImageSetConfiguration
+          ansible.builtin.debug:
+            var: image_set_config
+
+        - name: Write ImageSetConfiguration to file
+          ansible.builtin.copy:
+            content: "{{ image_set_config | to_nice_yaml }}"
+            dest: "{{ imageset_config_path }}"
+            mode: '0644'
+
+        # ---- Run oc-mirror v2 ----
+
+        - name: Remove previous oc-mirror workspace
+          ansible.builtin.file:
+            path: "{{ oc_mirror_workspace }}"
+            state: absent
+
+        - name: Run oc-mirror to mirror operator content to disconnected registry
+          ansible.builtin.shell: >-
+            env -u REGISTRY_AUTH_FILE oc-mirror
+            --authfile "{{ pull_secret_path }}"
+            -c "{{ imageset_config_path }}"
+            --workspace file://{{ oc_mirror_workspace }}
+            docker://{{ mirror_registry }}/{{ operator_mirror_prefix }}
+            --dest-tls-verify=false
+            --ignore-release-signature
+            --v2
+          register: oc_mirror_result
+          changed_when: true
+          retries: 3
+          delay: 30
+          until: oc_mirror_result.rc == 0
+
+        - name: Show oc-mirror output
+          ansible.builtin.debug:
+            var: oc_mirror_result.stdout_lines
+
+        # ---- Apply generated manifests to hub ----
+
+        - name: Find generated CatalogSource and IDMS manifests
+          ansible.builtin.find:
+            paths: "{{ oc_mirror_workspace }}/working-dir/cluster-resources/"
+            patterns:
+              - "cs*.yaml"
+              - "idms*.yaml"
+            file_type: file
+          register: oc_mirror_manifests
+
+        - name: Display generated manifests
+          ansible.builtin.debug:
+            msg: "Found {{ oc_mirror_manifests.files | length }} manifests: {{ oc_mirror_manifests.files | map(attribute='path') | list }}"
+
+        - name: Apply generated manifests to hub cluster
+          kubernetes.core.k8s:
+            kubeconfig: "{{ kubeconfig }}"
+            state: present
+            src: "{{ item.path }}"
+          loop: "{{ oc_mirror_manifests.files }}"
+          loop_control:
+            label: "{{ item.path | basename }}"
+
+        # ---- Mirror MCE/RHACM images (direct path, skopeo) ----
 
         - name: Mirror MCE/RHACM images to disconnected registry
           ansible.builtin.command:
@@ -228,52 +291,7 @@
           changed_when: true
           when: mce_rhacm_images | length > 0
 
-        # ---- Mirror operator images (operators/ prefix) ----
-
-        - name: Mirror operator images to disconnected registry
-          ansible.builtin.command:
-            cmd: >-
-              skopeo copy --all --remove-signatures
-              --authfile {{ pull_secret_path }}
-              --dest-tls-verify=false
-              docker://{{ item }}
-              docker://{{ mirror_registry }}/{{ operator_mirror_prefix }}/{{ item | regex_replace('^[^/]+/', '') }}
-          loop: "{{ operator_images }}"
-          loop_control:
-            label: "{{ item | regex_replace('^.*/([^@:]+).*$', '\\1') }}"
-          register: skopeo_ops
-          retries: 3
-          delay: 3
-          until: skopeo_ops.rc == 0
-          changed_when: true
-          when: operator_images | length > 0
-
-        # ---- Mirror operator catalog index images ----
-
-        - name: Create permissive container policy for catalog index mirroring
-          ansible.builtin.copy:
-            content: '{"default": [{"type": "insecureAcceptAnything"}]}'
-            dest: /tmp/mirror-permissive-policy.json
-            mode: '0600'
-
-        - name: Mirror operator catalog index images to disconnected registry
-          ansible.builtin.command:
-            cmd: >-
-              skopeo copy --all --remove-signatures --policy /tmp/mirror-permissive-policy.json
-              --authfile {{ pull_secret_path }}
-              --dest-tls-verify=false
-              docker://{{ item.source }}
-              docker://{{ mirror_registry }}/{{ item.destination }}
-          loop: "{{ spoke_catalog_index_images }}"
-          loop_control:
-            label: "{{ item.source }}"
-          register: skopeo_catalog
-          retries: 3
-          delay: 3
-          until: skopeo_catalog.rc == 0
-          changed_when: true
-
-        # ---- Create IDMS resources ----
+        # ---- Create MCE/RHACM IDMS resources ----
 
         - name: Create multicluster-engine-mirror IDMS
           kubernetes.core.k8s:
@@ -307,41 +325,15 @@
                       - "{{ mirror_registry }}/rhacm2"
           when: mce_rhacm_images | select('match', '.*/rhacm2/.*') | list | length > 0
 
-        - name: Derive unique (source_registry, namespace) pairs from operator images
-          ansible.builtin.set_fact:
-            operator_idms_entries: >-
-              {{
-                operator_images
-                | map('regex_replace', '/[^/]+(@sha256:.*|:.*)?$', '')
-                | unique | sort
-                | map('regex_replace', '^(' ~ source_registry_rht ~ ')/(.+)$',
-                    '{"source": "' ~ source_registry_rht ~ '/\\2", "mirrors": ["' ~ mirror_registry ~ '/' ~ operator_mirror_prefix ~ '/\\2"]}')
-                | map('regex_replace', '^(' ~ source_registry_connect ~ ')/(.+)$',
-                    '{"source": "' ~ source_registry_connect ~ '/\\2", "mirrors": ["' ~ mirror_registry ~ '/' ~ operator_mirror_prefix ~ '/\\2"]}')
-                | map('from_json')
-                | unique | list
-              }}
-          when: operator_images | length > 0
-
-        - name: Create operators-catalog-mirror IDMS
-          kubernetes.core.k8s:
-            state: present
-            kubeconfig: "{{ kubeconfig }}"
-            definition:
-              apiVersion: config.openshift.io/v1
-              kind: ImageDigestMirrorSet
-              metadata:
-                name: operators-catalog-mirror
-              spec:
-                imageDigestMirrors: "{{ operator_idms_entries }}"
-          when: operator_idms_entries | default([]) | length > 0
+        # ---- Summary ----
 
         - name: Display summary
           ansible.builtin.debug:
             msg: >-
-              Mirrored {{ mce_rhacm_images | length }} MCE/RHACM images and
-              {{ operator_images | length }} operator catalog images.
-              IDMS resources created for mirror registry {{ mirror_registry }}.
+              Mirrored {{ mce_rhacm_images | length }} MCE/RHACM images (skopeo, direct path).
+              Mirrored operator catalog content via oc-mirror v2 ({{ operator_mirror_prefix }}/ prefix).
+              Applied {{ oc_mirror_manifests.files | length }} generated IDMS/CatalogSource manifests.
+              Created MCE/RHACM IDMS on hub {{ mirror_registry }}.
 
       always:
 
@@ -350,7 +342,12 @@
             path: "{{ pull_secret_path }}"
             state: absent
 
-        - name: Clean up temporary permissive policy file
+        - name: Clean up ImageSetConfiguration file
           ansible.builtin.file:
-            path: /tmp/mirror-permissive-policy.json
+            path: "{{ imageset_config_path }}"
+            state: absent
+
+        - name: Clean up oc-mirror workspace
+          ansible.builtin.file:
+            path: "{{ oc_mirror_workspace }}"
             state: absent
