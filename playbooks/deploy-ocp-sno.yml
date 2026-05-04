@@ -36,7 +36,8 @@
 # - disconnected_registry_url, disconnected_registry_port
 # - share_http_iso_port, dest_iso_dir, repo_root_path
 # - extra_manifests_folder: folder containing extra manifests for Day0 installation
-# - disable_insights (boolean; default is false): excludes the Insights capability from installation
+# - capabilities (comma-separated string): when set, configures baselineCapabilitySet=None and
+#     uses the listed capabilities as additionalEnabledCapabilities in install-config.yaml
 
 ## Roles Requirements
 # - ocp_version_facts
@@ -74,6 +75,11 @@
 #   Disconnected dual-stack from quay pullspec:
 #     ansible-playbook ./playbooks/deploy-ocp-sno.yml -i ./inventories/ocp-deployment/deploy-ocp-sno.yml \
 #       --extra-vars 'release=quay.io/openshift-release-dev/ocp-release:4.17.9-x86_64 cluster_name=my-sno disconnected=true'
+#
+#   Disconnected + custom capabilities (e.g. exclude Insights):
+#     ansible-playbook ./playbooks/deploy-ocp-sno.yml -i ./inventories/ocp-deployment/deploy-ocp-sno.yml \
+#       --extra-vars 'release=quay.io/openshift-release-dev/ocp-release:4.17.9-x86_64 cluster_name=my-sno disconnected=true \
+#       capabilities=Build,CSISnapshot,CloudControllerManager,CloudCredential,Console,DeploymentConfig,ImageRegistry,Ingress,MachineAPI,NodeTuning,OperatorLifecycleManager,OperatorLifecycleManagerV1,Storage,baremetal,marketplace,openshift-samples'
 #
 # Notes:
 # - The playbook fails early if ipv6_only=true and disconnected=false (scenario not supported).
@@ -507,7 +513,6 @@
   vars:
     release: "4.17"
     disconnected: false
-    disable_insights: false
   tasks:
 
     - name: Ensure cluster name is set
@@ -571,16 +576,19 @@
           ansible.builtin.import_role:
             name: redhatci.ocp.generate_manifests
 
-    - name: Exclude Insights capability from installation
-      when: disable_insights | bool
+    - name: Set cluster capabilities in install-config
+      when: capabilities is defined and capabilities | length > 0
+      vars:
+        _caps_list: "{{ capabilities.split(',') | map('trim') | list }}"
       ansible.builtin.blockinfile:
         path: "{{ repo_root_path }}/generated/{{ cluster_name }}/install-config.yaml"
-        marker: "# {mark} DISABLE INSIGHTS"
+        marker: "# {mark} MANAGED BLOCK - capabilities"
+        insertafter: EOF
         block: |
           capabilities:
-            baselineCapabilitySet: vCurrent
-            additionalDisabledCapabilities:
-              - Insights
+            baselineCapabilitySet: "None"
+            additionalEnabledCapabilities:
+            {{ _caps_list | to_nice_yaml | indent(2) | trim }}
 
     - name: Disable image policy for nightly/engineering-candidate/release-candidate builds
       when:
