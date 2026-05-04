@@ -36,7 +36,7 @@
 # - disconnected_registry_url, disconnected_registry_port
 # - share_http_iso_port, dest_iso_dir, repo_root_path
 # - extra_manifests_folder: folder containing extra manifests for Day0 installation
-# - disable_insights (boolean; default is false): removes cloud.openshift.com from pull secret to opt out of remote health reporting
+# - disable_insights (boolean; default is false): excludes the Insights capability from installation
 
 ## Roles Requirements
 # - ocp_version_facts
@@ -521,16 +521,6 @@
         path: "{{ repo_root_path }}/generated/{{ cluster_name }}"
         state: absent
 
-    - name: Remove cloud.openshift.com from pull secret to disable Insights
-      when: disable_insights | bool
-      ansible.builtin.set_fact:
-        pull_secret: >-
-          {{ pull_secret | combine({
-               'auths': pull_secret.auths | dict2items
-                 | rejectattr('key', 'equalto', 'cloud.openshift.com')
-                 | items2dict
-             }, recursive=True) }}
-
     - name: Generate deployment manifests for OpenShift installation
       when: (disconnected | bool) is false
       vars:
@@ -580,6 +570,17 @@
             ocp_registry_image: openshift
           ansible.builtin.import_role:
             name: redhatci.ocp.generate_manifests
+
+    - name: Exclude Insights capability from installation
+      when: disable_insights | bool
+      ansible.builtin.blockinfile:
+        path: "{{ repo_root_path }}/generated/{{ cluster_name }}/install-config.yaml"
+        marker: "# {mark} DISABLE INSIGHTS"
+        block: |
+          capabilities:
+            baselineCapabilitySet: vCurrent
+            additionalDisabledCapabilities:
+              - Insights
 
     - name: Disable image policy for nightly/engineering-candidate/release-candidate builds
       when:
