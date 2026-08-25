@@ -17,7 +17,11 @@
     force_basic_auth: true
     validate_certs: false
     timeout: 30
+    status_code: [200]
   register: _bmc_system
+  until: _bmc_system is succeeded
+  retries: 5
+  delay: 5
   no_log: "{{ ansible_verbosity < 3 }}"
 
 - name: "{{ bmc_ip }} | Store current boot order"
@@ -33,9 +37,18 @@
     force_basic_auth: true
     validate_certs: false
     timeout: 30
+    status_code: [200]
   register: _bmc_boot_options_collection
+  until: _bmc_boot_options_collection is succeeded
+  retries: 5
+  delay: 5
   no_log: "{{ ansible_verbosity < 3 }}"
 
+# iLO5 Redfish intermittently returns a transient 500/503 (or drops the TLS
+# connection) on a per-boot-option GET, especially while the host is POSTing and
+# re-enumerating boot entries. Without a per-item retry, one blip fails the whole
+# loop. Retry each item so a transient error self-heals. This task is a read-only
+# GET (changed=false), so retrying is safe/idempotent.
 - name: "{{ bmc_ip }} | Get details for each boot option"
   ansible.builtin.uri:
     url: "https://{{ bmc_ip }}{{ item['@odata.id'] }}"
@@ -45,10 +58,14 @@
     force_basic_auth: true
     validate_certs: false
     timeout: 30
+    status_code: [200]
   loop: "{{ _bmc_boot_options_collection.json.Members }}"
   loop_control:
     label: "{{ item['@odata.id'] | basename }}"
   register: _bmc_boot_option_details
+  until: _bmc_boot_option_details is succeeded
+  retries: 5
+  delay: 5
   no_log: "{{ ansible_verbosity < 3 }}"
 
 - name: "{{ bmc_ip }} | Display current boot options"
@@ -100,6 +117,10 @@
         BootOrder: "{{ _bmc_new_boot_order }}"
     timeout: 30
     status_code: [200, 204]
+  register: _bmc_boot_order_patch
+  until: _bmc_boot_order_patch is succeeded
+  retries: 5
+  delay: 5
   when: _bmc_new_boot_order != _bmc_current_boot_order
   no_log: "{{ ansible_verbosity < 3 }}"
 
