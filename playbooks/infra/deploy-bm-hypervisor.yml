@@ -146,6 +146,86 @@
     system_rpm_path: "/tmp/{{ system_rpm_link | basename }}"
     http_store_port: "8888"
   tasks:
+    # A previous deployment can leave an ISO URL in the BMC's CD slot while the
+    # media is not attached (ConnectedVia: NotConnected, Image set). The BMC
+    # still reports the slot as occupied, so VirtualMediaInsert later fails
+    # with "Unable to find an available VirtualMedia resource supporting
+    # ['CD','DVD']". redhatci.ocp.dell's own eject step cannot clear this: the
+    # module only ejects slots it considers inserted, returning "already ejected"
+    # without clearing Image. Clear it here, before boot_iso runs.
+    - name: Clear stale virtual media left by a previous deployment
+      when: vendor | default('') | lower == 'dell'
+      delegate_to: bastion
+      vars:
+        # 'Inserted' is not among the properties redfish_info returns, so an
+        # unattached-but-occupied slot is identified by ConnectedVia instead.
+        # Slots with ConnectedVia == URI are genuinely attached and are left
+        # for the vendor role to eject normally.
+        stale_query: >-
+          [?(ConnectedVia == `NotConnected`
+             && Image != null
+             && (contains(MediaTypes, `CD`) || contains(MediaTypes, `DVD`)))]
+      block:
+        - name: Get virtual media state
+          community.general.redfish_info:
+            category: Manager
+            command: GetVirtualMedia
+            baseuri: "{{ bmc_address }}"
+            username: "{{ bmc_user }}"
+            password: "{{ bmc_password }}"
+            timeout: 120
+          register: virtual_media_state
+          retries: 3
+          delay: 10
+          until: virtual_media_state is succeeded
+
+        - name: Select CD/DVD slots holding an unattached image
+          ansible.builtin.set_fact:
+            stale_virtual_media: "{{ virtual_media_state.redfish_facts.virtual_media.entries
+                | flatten(levels=2)
+                | selectattr('ConnectedVia', 'defined') | list
+                | json_query(stale_query) | from_yaml }}"
+
+        - name: Eject stale image from the BMC virtual media slot
+          # The resource itself only allows GET,HEAD on this hardware, so the
+          # image cannot be cleared by PATCHing Image to null - the EjectMedia
+          # action is the only supported route.
+          vars:
+            virtual_media_base: "https://{{ bmc_address }}/redfish/v1/Managers"
+          ansible.builtin.uri:
+            url: "{{ virtual_media_base }}/iDRAC.Embedded.1/VirtualMedia/\
+                  {{ item.Id }}/Actions/VirtualMedia.EjectMedia"
+            method: POST
+            body: {}
+            body_format: json
+            url_username: "{{ bmc_user }}"
+            url_password: "{{ bmc_password }}"
+            force_basic_auth: true
+            validate_certs: false
+            status_code: [200, 202, 204]
+            timeout: 120
+          loop: "{{ stale_virtual_media }}"
+          loop_control:
+            label: "{{ item.Id }} ({{ item.ImageName | default('unknown') }})"
+
+        - name: Confirm the slots are now free
+          when: stale_virtual_media | length > 0
+          community.general.redfish_info:
+            category: Manager
+            command: GetVirtualMedia
+            baseuri: "{{ bmc_address }}"
+            username: "{{ bmc_user }}"
+            password: "{{ bmc_password }}"
+            timeout: 120
+          register: virtual_media_recheck
+          retries: 6
+          delay: 10
+          until: virtual_media_recheck is succeeded
+                 and (virtual_media_recheck.redfish_facts.virtual_media.entries
+                      | flatten(levels=2)
+                      | selectattr('ConnectedVia', 'defined') | list
+                      | json_query(stale_query) | from_yaml | length) == 0
+
     - name: Boot BM using pre-configured ISO
       ansible.builtin.import_role:
         name: redhatci.ocp.boot_iso

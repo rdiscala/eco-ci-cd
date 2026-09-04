@@ -47,6 +47,18 @@
       ansible.builtin.set_fact:
         local_volume_name: "{{ lvm_local_volumes | default(['vol1', 'vol2']) }}"
 
+    - name: Find existing VG device
+      ansible.builtin.set_fact:
+        empty_block_devices: >-
+          {{ ansible_lvm.pvs | dict2items
+             | selectattr('value.vg', 'equalto', vol_group_name)
+             | map(attribute='key')
+             | first
+             | regex_replace('^/dev/', '') }}
+      when:
+        - ansible_lvm is defined
+        - ansible_lvm.pvs | dict2items | selectattr('value.vg', 'equalto', vol_group_name) | list | length > 0
+
     - name: Find empty block devices from facts
       ansible.builtin.set_fact:
         empty_block_devices: >-
@@ -59,17 +71,18 @@
              | map(attribute='key')
              | list
              | first }}
+      when: empty_block_devices is not defined
 
-    - name: Show empty block devices
+    - name: Show target block device
       ansible.builtin.debug:
         var: empty_block_devices
 
-    - name: Fail if no empty block devices
+    - name: Fail if no target block device found
       ansible.builtin.assert:
         that:
           - empty_block_devices is defined
           - (empty_block_devices | length) > 0
-        fail_msg: "No empty block devices found on {{ inventory_hostname }}"
+        fail_msg: "No empty or existing VG block device found on {{ inventory_hostname }}"
 
     - name: Remove any existing volume group on {{ empty_block_devices }}
       community.general.lvg:
