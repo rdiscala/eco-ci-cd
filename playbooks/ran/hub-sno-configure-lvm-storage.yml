@@ -47,42 +47,45 @@
       ansible.builtin.set_fact:
         local_volume_name: "{{ lvm_local_volumes | default(['vol1', 'vol2']) }}"
 
-    - name: Find empty block devices from facts
-      ansible.builtin.set_fact:
-        empty_block_devices: >-
-          {{ (ansible_devices | default({}))
-             | dict2items
-             | selectattr('key','match','^((sd|hd|vd|xvd)[a-z]+|nvme\\d+n\\d+)$')
-             | rejectattr('value.removable','equalto','1')
-             | selectattr('value.partitions','equalto',{})
-             | selectattr('value.holders','equalto',[])
-             | map(attribute='key')
-             | list
-             | first }}
-
-    - name: Show empty block devices
-      ansible.builtin.debug:
-        var: empty_block_devices
-
-    - name: Fail if no empty block devices
+    - name: Verify LVM volume group facts are available
       ansible.builtin.assert:
         that:
-          - empty_block_devices is defined
-          - (empty_block_devices | length) > 0
-        fail_msg: "No empty block devices found on {{ inventory_hostname }}"
+          - ansible_facts.lvm is mapping
+          - ansible_facts.lvm.vgs is defined
+        fail_msg: "LVM volume group facts unavailable on {{ inventory_hostname }}; refusing to modify storage"
 
-    - name: Remove any existing volume group on {{ empty_block_devices }}
-      community.general.lvg:
-        vg: "{{ vol_group_name }}"
-        pvs: "/dev/{{ empty_block_devices }}"
-        state: absent
-        force: true
+    - name: Create volume group when it does not already exist
+      when: vol_group_name not in ansible_facts.lvm.vgs
+      block:
+        - name: Find empty block devices from facts
+          ansible.builtin.set_fact:
+            empty_block_devices: >-
+              {{ (ansible_devices | default({}))
+                 | dict2items
+                 | selectattr('key','match','^((sd|hd|vd|xvd)[a-z]+|nvme\\d+n\\d+)$')
+                 | rejectattr('value.removable','equalto','1')
+                 | selectattr('value.partitions','equalto',{})
+                 | selectattr('value.holders','equalto',[])
+                 | map(attribute='key')
+                 | list
+                 | first | default('') }}
 
-    - name: Create volume group new_vol_group on {{ empty_block_devices }}
-      community.general.lvg:
-        vg: "{{ vol_group_name }}"
-        pvs: "/dev/{{ empty_block_devices }}"
-        state: present
+        - name: Show empty block devices
+          ansible.builtin.debug:
+            var: empty_block_devices
+
+        - name: Fail if no empty block devices
+          ansible.builtin.assert:
+            that:
+              - empty_block_devices is defined
+              - (empty_block_devices | length) > 0
+            fail_msg: "No empty block devices found on {{ inventory_hostname }}"
+
+        - name: Create volume group new_vol_group on {{ empty_block_devices }}
+          community.general.lvg:
+            vg: "{{ vol_group_name }}"
+            pvs: "/dev/{{ empty_block_devices }}"
+            state: present
 
     - name: Create logical volume (20GB) {{ item }}
       community.general.lvol:
